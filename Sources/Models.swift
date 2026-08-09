@@ -21,6 +21,9 @@ struct VPNServer: Identifiable, Hashable {
     let configBase64: String
     /// 設定に書かれていた proto（tcp / udp）
     let proto: String
+    /// 設定に書かれていた接続先ポート。共通プロファイル方式では
+    /// 管理インターフェースへ `remote MOD <ip> <port>` として渡す唯一の可変値になる。
+    let port: Int
     /// VPN Gate 公式クラスタ（public-vpn-*.opengw.net）か。
     /// 動画配信サービスに最初にブロックされるのがこの帯なので、用途によっては避けたい。
     let isOfficial: Bool

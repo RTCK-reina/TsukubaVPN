@@ -42,7 +42,10 @@ final class AppModel: ObservableObject {
     private let failureCooldown: TimeInterval = 600
 
     private let ctl = VPNController.shared
-    private var pollTask: Task<Void, Never>?
+    /// 常駐 openvpn を管理ソケット越しに操作する係。root 権限は要らない。
+    private let session = VPNSession()
+    /// 常駐 openvpn が生きていて、管理ソケットもつながっているか
+    @Published var daemonReady = false
 
     private func loadWatched() {
         watchedOK = Set(UserDefaults.standard.stringArray(forKey: okKey) ?? [])
@@ -75,12 +78,23 @@ final class AppModel: ObservableObject {
     // MARK: - 起動時
     func bootstrap() async {
         loadWatched()
-        dnsNeedsRestore = ctl.dnsNeedsRestore()
         dnsIssue = ctl.dnsIssue()
-        if ctl.isRunning() {
-            phase = .connected
-            progressText = "前回の接続が続いています"
+        session.onDropped = { [weak self] in
+            Task { @MainActor in
+                guard let self, self.phase.isConnected else { return }
+                self.connectedServer = nil
+                self.phase = .failed("サーバー側から切断されました。もう一度「つなぐ」を押してください。")
+            }
         }
+        // 前回の openvpn がまだ常駐していれば、パスワードなしでつなぎ直す
+        if ctl.isRunning(), session.attach(port: ctl.currentMgmtPort(), password: ctl.mgmtPassword) {
+            daemonReady = true
+            if ctl.dnsBackupExists() {
+                phase = .connected
+                progressText = "前回の接続が続いています"
+            }
+        }
+        dnsNeedsRestore = ctl.dnsBackupExists() && !phase.isConnected
         await refresh()
         await refreshIP()
     }
@@ -178,6 +192,9 @@ final class AppModel: ObservableObject {
     var plannedServer: VPNServer? { candidates.first }
 
     // MARK: - 接続
+
+    /// 接続。root（管理者パスワード）が要るのは openvpn を常駐させる最初の一度だけで、
+    /// 以後の乗り換え・切断・再接続は管理インターフェース経由なので何も聞かれない。
     func connect() async {
         guard let ov = openvpnPath ?? VPNController.findOpenVPN() else {
             phase = .failed("OpenVPN が見つかりません。下の「OpenVPN を入れる」を押してください。")
@@ -198,134 +215,178 @@ final class AppModel: ObservableObject {
         progressText = "準備しています…"
         connectedServer = nil
 
-        var cands: [Candidate] = []
-        for s in picks {
-            if let cfg = VPNGateAPI.decodeConfig(s.configBase64) { cands.append(Candidate(server: s, config: cfg)) }
-        }
-        guard !cands.isEmpty else {
-            phase = .failed("サーバー設定を読み取れませんでした。更新ボタンを押してやり直してください。")
-            return
-        }
-        let accepted: [Candidate]
-        do {
-            accepted = try ctl.prepare(candidates: cands, openvpn: ov)
-        } catch {
-            phase = .failed("準備に失敗しました: \(error.localizedDescription)")
-            progressText = ""
-            return
+        if !(ctl.isRunning() && session.isAttached) {
+            guard await startDaemon(openvpn: ov, using: picks) else { return }
         }
 
         phase = .connecting
-        progressText = "Mac のパスワードを入力してください（1回だけ）"
-
-        let scriptPath = ctl.runURL.path
-        let elevateTask = Task.detached(priority: .userInitiated) { () -> (Bool, String) in
-            VPNController.elevate(script: scriptPath)
+        progressText = "つないでいます…"
+        let total = picks.count
+        session.onProgress = { [weak self] n, s in
+            Task { @MainActor in
+                guard let self else { return }
+                self.progressText = "\(total)件中 \(n)件目を試しています… （\(s.flag) \(s.countryJa) / \(s.ip) / \(s.protoWord)）"
+            }
         }
-        startPolling(candidates: accepted.map { $0.server })
-        let (ok, msg) = await elevateTask.value
-        pollTask?.cancel()
-        pollTask = nil
+        let outcome = await session.connect(candidates: picks)
+        session.onProgress = nil
 
-        if !ok && msg == "CANCELLED" {
-            phase = .failed("パスワードの入力がキャンセルされました。")
-            progressText = ""
-            return
-        }
-
-        let (_, success, idx) = ctl.readResult()
-        if success && ctl.isRunning() {
-            let s = (idx >= 1 && idx <= accepted.count) ? accepted[idx - 1].server : accepted[0].server
+        switch outcome {
+        case .connected(let s):
             connectedServer = s
             recentFailures[s.ip] = nil
             // 採用されたものより前の候補は失敗しているので記録する
-            if idx >= 2 {
-                for k in 0..<(idx - 1) where k < accepted.count { recentFailures[accepted[k].server.ip] = Date() }
+            if let i = picks.firstIndex(where: { $0.id == s.id }), i >= 1 {
+                for k in 0..<i { recentFailures[picks[k].ip] = Date() }
             }
             phase = .connected
             progressText = ""
             dnsIssue = ctl.dnsIssue()
             await refreshIP()
             dnsNeedsRestore = false
-        } else {
+        case .exhausted:
+            for s in picks { recentFailures[s.ip] = Date() }
             let raw = ctl.recentLog()
-            let (_, _, _) = ctl.readResult()
-            for c in accepted { recentFailures[c.server.ip] = Date() }
-            let portBusy = raw.contains("Socket bind failed")
-                || (try? String(contentsOf: ctl.resultURL, encoding: .utf8))?.contains("PORT_BUSY") == true
-            let refused = raw.contains("auth-failure") || raw.contains("AUTH_FAILED")
-            let scriptFailed = raw.contains("--up/--down command failed") || raw.contains("Failed running command (--up)")
-            let busy = (try? String(contentsOf: ctl.resultURL, encoding: .utf8))?.contains("BUSY") == true
-            let msg: String
-            if scriptFailed {
-                msg = "DNS設定の切り替えに失敗したため接続を中断しました。「くわしい設定 → DNS設定を元に戻す」を押してからやり直してください。"
-            } else if busy {
-                msg = "前回の接続処理がまだ動いています。少し待ってからもう一度お試しください。"
-            } else if portBusy {
-                msg = "通信用のポートがふさがっていました。もう一度ボタンを押してください（自動で別のポートを使います）。"
-            } else if refused {
-                msg = "サーバーが混んでいて断られました。少し待つか、上の国を変えてもう一度お試しください。"
-            } else {
-                msg = "\(accepted.count)台試しましたが、どれもつながりませんでした。「一覧を更新」を押してからもう一度お試しください。"
-            }
-            phase = .failed(msg)
-            progressText = ""
             logText = raw
-            dnsNeedsRestore = ctl.dnsNeedsRestore()
+            phase = .failed(connectFailureMessage(log: raw, tried: picks.count))
+            progressText = ""
+            dnsNeedsRestore = ctl.dnsBackupExists()
+        case .error(let m):
+            logText = ctl.recentLog()
+            daemonReady = ctl.isRunning() && session.isAttached
+            phase = .failed("\(m)。もう一度「つなぐ」を押してください。")
+            progressText = ""
+            dnsNeedsRestore = ctl.dnsBackupExists() && !phase.isConnected
         }
     }
 
-    private func startPolling(candidates: [VPNServer]) {
-        pollTask?.cancel()
-        pollTask = Task { [weak self] in
-            while !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 600_000_000)
-                guard let self else { return }
-                let n = self.ctl.currentAttempt()
-                if n >= 1 && n <= candidates.count {
-                    let s = candidates[n - 1]
-                    self.progressText = "\(candidates.count)件中 \(n)件目を試しています… （\(s.flag) \(s.countryJa) / \(s.ip)）"
-                }
-            }
+    /// openvpn を常駐起動する。ここでだけ管理者パスワードを求める。
+    private func startDaemon(openvpn ov: String, using picks: [VPNServer]) async -> Bool {
+        guard let sample = picks.compactMap({ VPNGateAPI.decodeConfig($0.configBase64) }).first else {
+            phase = .failed("サーバー設定を読み取れませんでした。「一覧を更新」を押してやり直してください。")
+            progressText = ""
+            return false
         }
+        session.detach()
+        daemonReady = false
+        do {
+            try ctl.prepareDaemon(sampleConfig: sample, openvpn: ov)
+        } catch {
+            phase = .failed("準備に失敗しました: \(error.localizedDescription)")
+            progressText = ""
+            return false
+        }
+        phase = .connecting
+        progressText = "Mac のパスワードを1回だけ入力してください（次からは聞かれません）"
+        let script = ctl.daemonURL.path
+        let (ok, msg) = await Task.detached(priority: .userInitiated) { () -> (Bool, String) in
+            VPNController.elevate(script: script)
+        }.value
+        if !ok && msg == "CANCELLED" {
+            phase = .failed("パスワードの入力がキャンセルされました。")
+            progressText = ""
+            return false
+        }
+        guard ctl.isRunning() else {
+            let r = ctl.daemonResult()
+            logText = ctl.recentLog()
+            phase = .failed(r == "BAD_PROFILE"
+                ? "接続用の設定を作れませんでした。「一覧を更新」を押してからやり直してください。"
+                : "OpenVPN を起動できませんでした。「接続ログを見る」で内容を確認してください。")
+            progressText = ""
+            return false
+        }
+        guard session.attach(port: ctl.currentMgmtPort(), password: ctl.mgmtPassword) else {
+            phase = .failed("OpenVPN の管理接続に失敗しました。もう一度お試しください。")
+            progressText = ""
+            return false
+        }
+        daemonReady = true
+        return true
+    }
+
+    private func connectFailureMessage(log raw: String, tried: Int) -> String {
+        if raw.contains("--up/--down command failed") || raw.contains("Failed running command (--up)") {
+            return "DNS設定の切り替えに失敗したため接続を中断しました。「くわしい設定 → DNS設定を元に戻す」を押してからやり直してください。"
+        }
+        if raw.contains("auth-failure") || raw.contains("AUTH_FAILED") {
+            return "サーバーが混んでいて断られました。少し待つか、上の国を変えてもう一度お試しください。"
+        }
+        if raw.contains("Cannot allocate TUN") {
+            return "仮想ネットワークを作れませんでした。Mac を再起動してからもう一度お試しください。"
+        }
+        return "\(tried)台試しましたが、どれもつながりませんでした。「一覧を更新」を押してからもう一度お試しください。"
     }
 
     // MARK: - 切断
+
+    /// 切断する。openvpn は待機状態で常駐させたままにするので、次につなぐときも
+    /// パスワードは聞かれない。DNS は down.sh が元に戻す。
     @discardableResult
     func disconnect() async -> Bool {
         phase = .disconnecting
         progressText = "切断しています…"
-        let c = ctl
-        let (stopped, detail) = await Task.detached(priority: .userInitiated) { () -> (Bool, String) in
-            _ = c.managementSignalTerm()
-            for _ in 0..<20 {
-                if !c.isRunning() { break }
-                usleep(300_000)
+        var ok = await session.hold()
+        if !ok {
+            // 管理ソケットが効かないときの最後の手段（ここはパスワードが要る）
+            let c = ctl
+            ok = await Task.detached(priority: .userInitiated) { () -> Bool in
+                _ = c.managementSignalTerm()
+                for _ in 0..<20 {
+                    if !c.isRunning() { break }
+                    usleep(300_000)
+                }
+                if c.isRunning() { _ = VPNController.elevate(script: c.stopURL.path) }
+                return !c.isRunning()
+            }.value
+            if ok {
+                session.detach()
+                daemonReady = false
             }
-            if c.isRunning() {
-                let (ok, message) = VPNController.elevate(script: c.stopURL.path)
-                return (!c.isRunning(), ok ? message : "強制停止に失敗しました: \(message)")
-            }
-            return (true, "")
-        }.value
-        guard stopped else {
+        }
+        guard ok else {
             phase = .failed("VPN を切断できませんでした。接続ログを確認して、もう一度お試しください。")
             progressText = ""
-            logText = detail.isEmpty ? ctl.recentLog() : detail + "\n" + ctl.recentLog()
-            dnsNeedsRestore = ctl.dnsNeedsRestore()
+            logText = ctl.recentLog()
+            dnsNeedsRestore = ctl.dnsBackupExists()
             return false
         }
         connectedServer = nil
         phase = .idle
         progressText = ""
-        dnsNeedsRestore = ctl.dnsNeedsRestore()
         dnsIssue = ctl.dnsIssue()
+        dnsNeedsRestore = ctl.dnsBackupExists()
         await refreshIP()
         if dnsNeedsRestore {
             phase = .failed("VPN は切れましたが、DNS 設定を元に戻せませんでした。「元に戻す」を押してください。")
             return false
         }
         return true
+    }
+
+    /// アプリ終了時に常駐 openvpn ごと片付ける。root は要らない。
+    @discardableResult
+    func shutdown() async -> Bool {
+        session.terminate()
+        for _ in 0..<25 {
+            if !ctl.isRunning() { break }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        daemonReady = false
+        var ok = true
+        if ctl.isRunning() {
+            let c = ctl
+            ok = await Task.detached(priority: .userInitiated) { () -> Bool in
+                _ = VPNController.elevate(script: c.stopURL.path)
+                return !c.isRunning()
+            }.value
+        }
+        connectedServer = nil
+        if !phase.isBusy, phase.failMessage == nil { phase = .idle }
+        progressText = ""
+        dnsIssue = ctl.dnsIssue()
+        dnsNeedsRestore = ctl.dnsBackupExists()
+        return ok
     }
 
     // MARK: - その他
@@ -376,7 +437,7 @@ final class AppModel: ObservableObject {
         let (ok, message) = await Task.detached(priority: .userInitiated) {
             VPNController.elevate(script: path)
         }.value
-        dnsNeedsRestore = ctl.dnsNeedsRestore()
+        dnsNeedsRestore = ctl.dnsBackupExists() && !phase.isConnected
         dnsIssue = ctl.dnsIssue()
         progressText = ""
         if !ok || dnsNeedsRestore {

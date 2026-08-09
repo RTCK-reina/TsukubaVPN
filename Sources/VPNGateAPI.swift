@@ -47,16 +47,21 @@ enum VPNGateAPI {
             guard f.count >= 15 else { continue }
             let cfg = f[f.count - 1].trimmingCharacters(in: .whitespaces)
             guard cfg.count > 400 else { continue }
-            let ip = f[1].trimmingCharacters(in: .whitespaces)
+            var ip = f[1].trimmingCharacters(in: .whitespaces)
             guard !ip.isEmpty else { continue }
-            // proto は設定本文にしか書かれていないので、ここで一度だけ読む
+            // proto と接続先ポートは設定本文にしか書かれていないので、ここで一度だけ読む。
+            // remote 行のホストは CSV の IP 欄より優先する（食い違うことがある）。
             var proto = "tcp"
-            if let cfg = decodeConfig(cfg) {
-                for line in cfg.normalizedLines {
+            var port = 1194
+            if let body = decodeConfig(cfg) {
+                for line in body.normalizedLines {
                     let t = line.trimmingCharacters(in: .whitespaces).lowercased()
                     if t.hasPrefix("proto ") {
                         proto = t.hasSuffix("udp") ? "udp" : "tcp"
-                        break
+                    } else if t.hasPrefix("remote ") {
+                        let parts = t.split(whereSeparator: { $0 == " " || $0 == "\t" })
+                        if parts.count >= 2, !parts[1].isEmpty { ip = String(parts[1]) }
+                        if parts.count >= 3, let p = Int(parts[2]), p > 0, p < 65536 { port = p }
                     }
                 }
             }
@@ -73,6 +78,7 @@ enum VPNGateAPI {
                 uptimeMs: Int(f[8]) ?? 0,
                 configBase64: cfg,
                 proto: proto,
+                port: port,
                 isOfficial: f[0].lowercased().hasPrefix("public-vpn"))
             out.append(s)
         }

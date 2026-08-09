@@ -127,12 +127,20 @@
 macOS 向け SwiftUI ネイティブアプリ。VPN Gate（筑波大学の学術実験プロジェクト）が公開している
 公開VPN中継サーバーの一覧を取得し、選んで OpenVPN で接続する。
 
+**中核は「共通プロファイル1枚 + 管理インターフェース」**。
+VPN Gate の全サーバーは ca / cert / key / cipher / auth が完全に同一で、
+違うのは `remote` と `proto` の2行だけ（毎回 verify.sh §3 で検証している）。
+そのため openvpn は共通プロファイルで**一度だけ root 起動して常駐**させ、
+接続先の指定・乗り換え・再試行・切断はすべて `--management-query-remote` 経由の
+管理コマンドで行う。**管理者パスワードを聞くのは openvpn を起動する最初の1回だけ**。
+
 ```
 Sources/
   Models.swift        VPNServer / VPNPolicy（候補数・一覧の鮮度しきい値の source of truth）
   VPNGateAPI.swift    CSV取得とパース
-  VPNController.swift openvpn の起動・停止・監視、管理IF、空きポート確保、設定の無害化と検証
-  Scripts.swift       root で走る5本のシェル（run / stop / up / down / selftest）のテンプレート
+  VPNController.swift openvpn の常駐起動・監視、共通プロファイル生成、空きポート確保、設定の無害化
+  Management.swift    管理IFの生ソケット（ManagementClient）と接続セッション（VPNSession）
+  Scripts.swift       root で走るシェル（daemon / stop / up / down / selftest）のテンプレート
   AppModel.swift      状態管理・候補選択・一覧の鮮度管理・失敗の記憶
   ContentView.swift   UI
   TsukubaVPNApp.swift エントリポイント
@@ -146,6 +154,7 @@ openvpn の `--up` / `--down` はスペース入りパスを引数分割して�
 ### 確定値 / source of truth
 
 - `VPNPolicy.candidateCount = 5` — 候補数。ここ以外に数字を書かない
+- `VPNSession.pollsPerCandidate = 2` — 1候補を何回の server-poll まで待つか
 - `VPNPolicy.listStaleAfter = 600` — 一覧をこの秒数放置したら接続前に取り直す
 - root で走るシェルは **すべて `Scripts.swift` の文字列が唯一の出所**。
   作業フォルダの `.sh` は毎回そこから書き出される生成物なので、直接編集しても次の接続で消える
@@ -161,11 +170,21 @@ openvpn の `--up` / `--down` はスペース入りパスを引数分割して�
 - **`--up` の非ゼロ終了は接続を殺す**: openvpn は `run_up_down` を `S_FATAL` で呼ぶ。
   DNS 切替の失敗で接続ごと落とさないため、`up.sh` / `down.sh` は必ず 0 で終わり、
   結果を `dns-status.txt` に残してアプリが警告する
-- **接続処理の排他**: `run.lock` がないと、取り残された run.sh が
-  次の openvpn を pid ファイル経由で殺しにいく
 - **公開サーバーは頻繁に落ちている**: 上位3台が同時に死んで4台目で成功は普通に起きる。
   「1台目で失敗」はバグではない。短時間に何十回も接続すると `auth-failure` で断られる
-- **設定は許可リスト方式で再構成**する。API 由来の文字列をそのまま openvpn に渡さない
+- **設定は許可リスト方式で再構成**する。API 由来の文字列をそのまま openvpn に渡さない。
+  共通プロファイルではさらに強く、外から取り込むのは `<ca>` `<cert>` `<key>` の中身だけで、
+  残りはすべて自前の固定文
+- **管理IFの受信は必ずバイト列で行分割する**: openvpn の管理IFは CRLF 区切り。
+  Swift の String では `"\r\n"` が1 Character なので `range(of: "\n")` が一致せず、
+  「受信しているのに1行も取り出せない」という**無言の停止**になる（実際に踏んだ）
+- **hold 中に `signal SIGUSR1` を送ると openvpn が固まる**（実測）。
+  待機中は `hold release` だけで進める。`VPNSession` は `>HOLD:` / `>STATE:` から
+  hold 状態を常に追いかけ、hold でないと分かっているときにしか SIGUSR1 を撃たない
+- **`remote SKIP` を両方の `<connection>` に返すと openvpn ごと終了する**。
+  接続先を聞かれたら必ずどちらか一方には `remote MOD` で答える
+- **`--persist-tun` のときは `--up-restart` が要る**。これがないと乗り換え時に
+  up / down が呼ばれず、DNS が張り替わらない
 
 ### ビルド / テスト
 
@@ -176,8 +195,10 @@ openvpn の `--up` / `--down` はスペース入りパスを引数分割して�
 ./record.sh start|stop|status   # 実接続時のブラックボックス記録
 ```
 
-`livetest.sh` は `dev null` で「utun を作る工程だけ」を回避し、本番と同一のシェルを
-実サーバーに対して走らせる。**ルート権限なしで到達できる限界まで通す**のが設計意図。
+`livetest.sh` は `dev null` で「utun を作る工程だけ」を回避し、本番と同一のシェル・
+同一のアプリコード（`VPNSession`）を実サーバーに対して走らせる。
+**ルート権限なしで到達できる限界まで通す**のが設計意図。
+networksetup はモックに差し替わるので、実機の DNS には触れない。
 
 ### 完了の定義（このプロジェクト固有）
 
@@ -188,7 +209,16 @@ openvpn の `--up` / `--down` はスペース入りパスを引数分割して�
    （build/ に置いただけで「完成」と言わない。一度これで事故った）
 5. 変更が接続経路に触るなら、`record.sh` で実接続を1回記録して `report.md` を確認する
 
-### 実接続で確認済み（2026-08-08 15:55、219.100.37.115）
+### 共通プロファイル方式で確認済み（2026-08-08、非rootの dev null 検証）
+
+- 全94台で `<ca>` `<cert>` `<key>` が完全一致（proto は tcp 82 / udp 12）
+- 1プロセスのまま udp → udp → tcp と乗り換え成功（各2〜7秒）
+- 死んだ接続先（192.0.2.1）では 12秒ごとに `>REMOTE:` を再問い合わせ → 次候補へ自動移行
+- `signal SIGUSR1` で hold に戻ると down が走り、`hold release` で up が走る（`--up-restart`）
+- hold のまま20秒放置しても勝手に再接続しない＝「切断したまま常駐」が成立する
+- 管理IFだけで完全終了（SIGTERM）でき、down で DNS が戻る
+
+### 旧方式（候補ごとに openvpn を起動し直す）での実接続確認（2026-08-08 15:55、219.100.37.115）
 
 root での utun 作成 / `do shell script` 経由 openvpn の生存 / up.sh の実行 /
 DNS の実書き換えと復元 / `redirect-gateway` による全経路切替 /

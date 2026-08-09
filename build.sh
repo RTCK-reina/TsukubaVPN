@@ -14,7 +14,7 @@ echo "SDK: $SDK"
 swiftc -O -target arm64-apple-macos14.0 -sdk "$SDK" \
   -o "$APP/Contents/MacOS/$BIN" \
   Sources/Models.swift Sources/VPNGateAPI.swift Sources/Scripts.swift \
-  Sources/VPNController.swift Sources/AppModel.swift Sources/ContentView.swift \
+  Sources/VPNController.swift Sources/Management.swift Sources/AppModel.swift Sources/ContentView.swift \
   Sources/TsukubaVPNApp.swift \
   -framework AppKit -framework SwiftUI
 

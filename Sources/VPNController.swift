@@ -59,7 +59,9 @@ final class VPNController: @unchecked Sendable {
     }
 
     // MARK: - paths
-    var runURL: URL { dir.appendingPathComponent("run.sh") }
+    var daemonURL: URL { dir.appendingPathComponent("daemon.sh") }
+    var sharedURL: URL { dir.appendingPathComponent("shared.ovpn") }
+    var logURL: URL { dir.appendingPathComponent("openvpn.log") }
     var stopURL: URL { dir.appendingPathComponent("stop.sh") }
     var upURL: URL { dir.appendingPathComponent("up.sh") }
     var downURL: URL { dir.appendingPathComponent("down.sh") }
@@ -207,61 +209,101 @@ final class VPNController: @unchecked Sendable {
         var errorDescription: String? { message }
     }
 
-    /// 設定を組み立てられた候補だけを書き出す。
-    /// 1台でも壊れていたら全部やめる、では公開VPNのばらつきに耐えられないので、
-    /// 壊れた候補はその1台だけ除外して続行し、実際に採用した候補を返す。
-    /// 返り値の並び順が run.sh の cand1..N とそのまま対応する。
-    @discardableResult
-    func prepare(candidates: [Candidate], openvpn: String) throws -> [Candidate] {
-        guard !candidates.isEmpty else { throw PrepareError(message: "接続候補がありません。") }
-        try allocateMgmtPort()
+    // MARK: - 共通プロファイル
+
+    /// VPN Gate の全サーバーは ca / cert / key / cipher / auth が完全に同一で、
+    /// サーバーごとに違うのは remote と proto の2行だけ（実測 94/94 台で一致）。
+    /// したがってプロファイルは1枚で足り、接続先は起動後に管理インターフェースから
+    /// 差し替えられる。proto の違いは <connection> を2つ置いて `remote SKIP` で吸収する。
+    static func buildSharedProfile(from cfg: String) -> String? {
+        func block(_ tag: String) -> String? {
+            let open = "<\(tag)>", close = "</\(tag)>"
+            guard let a = cfg.range(of: open), let b = cfg.range(of: close),
+                  a.upperBound <= b.lowerBound else { return nil }
+            let body = String(cfg[a.upperBound..<b.lowerBound])
+                .normalizedLines
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "\n")
+            guard body.contains("-----BEGIN"), body.contains("-----END") else { return nil }
+            return open + "\n" + body + "\n" + close
+        }
+        guard let ca = block("ca"), let cert = block("cert"), let key = block("key") else { return nil }
+        let head = """
+        # つくばVPN 共通プロファイル
+        # 接続先は起動後に管理インターフェースから指定する（--management-query-remote）
+        client
+        dev tun
+        nobind
+        persist-tun
+        resolv-retry infinite
+        remote-cert-tls server
+        auth SHA1
+        data-ciphers AES-256-GCM:AES-128-GCM:AES-256-CBC:AES-128-CBC
+        data-ciphers-fallback AES-128-CBC
+        mute-replay-warnings
+        pull
+        connect-retry 1
+        server-poll-timeout 12
+        <connection>
+        remote 127.0.0.1 1 udp
+        </connection>
+        <connection>
+        remote 127.0.0.1 1 tcp
+        </connection>
+        """
+        return head + "\n" + ca + "\n" + cert + "\n" + key + "\n"
+    }
+
+    static func sharedProfileIsValid(_ text: String) -> Bool {
+        guard text.utf8.count > 1000 else { return false }
+        for tag in ["<ca>", "</ca>", "<cert>", "</cert>", "<key>", "</key>"] where !text.contains(tag) {
+            return false
+        }
+        guard text.contains("<connection>") else { return false }
+        let lines = text.normalizedLines.map { $0.trimmingCharacters(in: .whitespaces) }
+        guard lines.contains("client") else { return false }
+        guard lines.contains(where: { $0.hasPrefix("remote ") }) else { return false }
+        return lines.contains(where: { $0.hasPrefix("dev ") })
+    }
+
+    /// 常駐 openvpn を起動する直前の準備。管理ポートを取り、共通プロファイルと
+    /// root で走るスクリプト（daemon.sh / up.sh / down.sh）を書き出す。
+    func prepareDaemon(sampleConfig: String, openvpn: String) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        for i in 1...8 where fm.fileExists(atPath: candURL(i).path) { try fm.removeItem(at: candURL(i)) }
-        for url in [resultURL, attemptURL] where fm.fileExists(atPath: url.path) { try fm.removeItem(at: url) }
-        var accepted: [Candidate] = []
-        var rejected: [String] = []
-        for c in candidates {
-            var text = VPNController.sanitize(c.config)
-            if !VPNController.looksValid(text) {
-                // base64 から作り直して一度だけ再試行する
-                if let again = VPNGateAPI.decodeConfig(c.server.configBase64) {
-                    text = VPNController.sanitize(again)
-                }
-            }
-            guard VPNController.looksValid(text) else {
-                rejected.append(c.server.ip)
-                continue
-            }
-            let u = candURL(accepted.count + 1)
-            try text.write(to: u, atomically: true, encoding: .utf8)
-            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: u.path)
-            let back = (try? String(contentsOf: u, encoding: .utf8)) ?? ""
-            guard VPNController.looksValid(back) else {
-                throw PrepareError(message: "設定ファイルを保存できませんでした（\(u.lastPathComponent)）。ディスクの空き容量を確認してください。")
-            }
-            accepted.append(c)
+        guard let profile = VPNController.buildSharedProfile(from: sampleConfig),
+              VPNController.sharedProfileIsValid(profile) else {
+            throw PrepareError(message: "共通プロファイルを組み立てられませんでした。「一覧を更新」を押してからやり直してください。")
         }
-        guard !accepted.isEmpty else {
-            throw PrepareError(message: "どのサーバーの設定も組み立てられませんでした（\(rejected.joined(separator: ", "))）。「一覧を更新」を押してからやり直してください。")
+        try allocateMgmtPort()
+        try profile.write(to: sharedURL, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: sharedURL.path)
+        let back = (try? String(contentsOf: sharedURL, encoding: .utf8)) ?? ""
+        guard VPNController.sharedProfileIsValid(back) else {
+            throw PrepareError(message: "共通プロファイルを保存できませんでした。ディスクの空き容量を確認してください。")
         }
         try mgmtPassword.write(to: passURL, atomically: true, encoding: .utf8)
         try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: passURL.path)
-
         try Scripts.up.write(to: upURL, atomically: true, encoding: .utf8)
         try Scripts.down.write(to: downURL, atomically: true, encoding: .utf8)
-        let run = Scripts.run
+        let d = Scripts.daemon
             .replacingOccurrences(of: "__DIR__", with: dir.path)
             .replacingOccurrences(of: "__OV__", with: openvpn)
-            .replacingOccurrences(of: "__N__", with: "\(accepted.count)")
             .replacingOccurrences(of: "__PORT__", with: "\(mgmtPort)")
-        try run.write(to: runURL, atomically: true, encoding: .utf8)
+        try d.write(to: daemonURL, atomically: true, encoding: .utf8)
         let stop = Scripts.stop.replacingOccurrences(of: "__DIR__", with: dir.path)
         try stop.write(to: stopURL, atomically: true, encoding: .utf8)
-        for u in [upURL, downURL, runURL, stopURL] {
+        for u in [upURL, downURL, daemonURL, stopURL] {
             try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: u.path)
         }
-        return accepted
+        for u in [resultURL, attemptURL] where fm.fileExists(atPath: u.path) { try? fm.removeItem(at: u) }
+    }
+
+    /// daemon.sh が残す起動結果（DAEMON_OK / DAEMON_FAILED / BAD_PROFILE）
+    func daemonResult() -> String {
+        (try? String(contentsOf: resultURL, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
     var selfTestURL: URL { dir.appendingPathComponent("selftest.sh") }
@@ -398,6 +440,7 @@ final class VPNController: @unchecked Sendable {
 
     func recentLog(lines: Int = 200) -> String {
         var files: [String] = []
+        if FileManager.default.fileExists(atPath: logURL.path) { files.append(logURL.path) }
         if let p = activeLogPath() { files.append(p) }
         if let items = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
             for f in items.sorted() where f.hasPrefix("try") && f.hasSuffix(".log") {
@@ -426,8 +469,11 @@ final class VPNController: @unchecked Sendable {
         return reason.isEmpty ? "DNS設定を切り替えられませんでした" : reason
     }
 
-    func dnsNeedsRestore() -> Bool {
-        FileManager.default.fileExists(atPath: dnsBackupURL.path) && !isRunning()
+    /// DNS の控えが残っているか。down.sh は復元に成功したときだけ控えを消すので、
+    /// 「残っている & つながっていない」＝復元に失敗した、と判断できる。
+    /// 常駐方式では切断してもプロセスは生きているため、isRunning() では判定できない。
+    func dnsBackupExists() -> Bool {
+        FileManager.default.fileExists(atPath: dnsBackupURL.path)
     }
 
     // MARK: - 切断
