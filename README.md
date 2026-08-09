@@ -1,5 +1,7 @@
 # つくばVPN
 
+[![build](https://github.com/RTCK-reina/TsukubaVPN/actions/workflows/build.yml/badge.svg)](https://github.com/RTCK-reina/TsukubaVPN/actions/workflows/build.yml)
+
 VPN Gate（筑波大学の学術実験プロジェクトが公開している公開VPN中継サーバー群）から
 サーバーを選んで、ボタン1つで macOS を VPN 接続させるネイティブアプリ。
 
@@ -133,5 +135,35 @@ Terminal 上で独立して動くので、Claude を落としても記録は続�
 rm -rf "/Applications/つくばVPN.app" ~/Library/TsukubaVPN
 brew uninstall openvpn   # 他で使っていなければ
 ```
+
+## 開発の進めかた
+
+`main` は保護されています。直接 push はできません。
+
+```sh
+git switch -c fix/なにか
+# 直して
+./build.sh && ./verify.sh && ./livetest.sh
+git commit -am "..."
+git push -u origin fix/なにか
+gh pr create --fill && gh pr merge --squash --delete-branch
+```
+
+PR には CI（macOS ランナーでのビルド・バンドル検査・シェルテンプレートの構文検査）が走り、
+これが通らないとマージできません。承認者は不要（approvals = 0）です。
+
+CI では `verify.sh` / `livetest.sh` を回していません。これらは VPN Gate に実接続するため、
+CI の IP から自動で叩き続けるのは学術実験プロジェクトへの迷惑になるからです。
+接続経路に触る変更をしたときは、手元で `./livetest.sh` と `./record.sh` を回してください。
+
+緊急時に保護を一時解除する場合は Settings → Branches → main の Edit から。
+
+## ライセンス
+
+MIT License（[LICENSE](LICENSE)）。
+
+VPN Gate 自体は筑波大学の学術実験プロジェクトであり、このリポジトリとは無関係です。
+サーバーはボランティアによって提供されています。短時間に大量の接続を行うなど、
+提供者の負担になる使い方はしないでください。
 
 © RTCK

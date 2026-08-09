@@ -1,0 +1,75 @@
+name: build
+
+# 実サーバーに接続する verify.sh / livetest.sh は CI から意図的に外している。
+# VPN Gate は筑波大学の学術実験プロジェクトであり、
+# CI の IP から自動で叩き続けるのは迷惑になるため。ビルドと静的検査だけを回す。
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ツールチェーン
+        run: |
+          sw_vers
+          swift --version
+          xcrun --show-sdk-path
+
+      - name: アプリをビルド
+        run: ./build.sh
+
+      - name: バンドルを検査
+        run: |
+          APP="build/つくばVPN.app"
+          test -x "$APP/Contents/MacOS/TsukubaVPN"
+          test -f "$APP/Contents/Resources/AppIcon.icns"
+          plutil -lint "$APP/Contents/Info.plist"
+          codesign --verify --deep --strict "$APP"
+          echo "OK: $(du -sh "$APP" | cut -f1)"
+
+      - name: テストコードもコンパイルが通るか
+        run: |
+          SDK="$(xcrun --show-sdk-path)"
+          swiftc -target arm64-apple-macos14.0 -sdk "$SDK" -o /tmp/verify \
+            Sources/Models.swift Sources/VPNGateAPI.swift Sources/Scripts.swift \
+            Sources/VPNController.swift Test/main.swift
+          swiftc -target arm64-apple-macos14.0 -sdk "$SDK" -o /tmp/livetest \
+            Sources/Models.swift Sources/VPNGateAPI.swift Sources/Scripts.swift \
+            Sources/VPNController.swift Test/Live/main.swift
+
+      - name: 生成されるシェルの構文を検査
+        run: |
+          for f in build.sh verify.sh livetest.sh record.sh; do bash -n "$f"; done
+          python3 -m py_compile record.sh.report.py
+          # Scripts.swift のテンプレートを実際に書き出して構文チェックする
+          python3 - <<'PY'
+          import re, subprocess, sys, tempfile, os
+          src = open("Sources/Scripts.swift", encoding="utf-8").read()
+          def unswift(t):
+              return t.replace('\\\\', '\x00').replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\x00', '\\')
+          ng = 0
+          for name in ["run", "stop", "up", "down", "selftest"]:
+              m = re.search(r'static let %s = """\n(.*?)\n    """' % name, src, re.S)
+              if not m:
+                  print(f"NG: {name} が見つからない"); ng += 1; continue
+              body = unswift(m.group(1))
+              body = "\n".join(l[4:] if l.startswith("    ") else l for l in body.split("\n"))
+              body = (body.replace("__DIR__", "/tmp/x").replace("__OV__", "/bin/true")
+                          .replace("__N__", "1").replace("__PORT__", "41200"))
+              p = os.path.join(tempfile.mkdtemp(), name + ".sh")
+              open(p, "w").write(body + "\n")
+              sh = "/bin/bash" if body.startswith("#!/bin/bash") else "/bin/sh"
+              r = subprocess.run([sh, "-n", p], capture_output=True, text=True)
+              print(("OK " if r.returncode == 0 else "NG ") + name + ".sh " + r.stderr.strip())
+              ng += (r.returncode != 0)
+          sys.exit(1 if ng else 0)
+          PY
