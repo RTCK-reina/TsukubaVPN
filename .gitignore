@@ -1,0 +1,16 @@
+# ビルド成果物（build.sh でいつでも作り直せる）
+build/
+
+# 接続テストの記録（実行環境ごとに異なる／IPなどが入る）
+logs/
+
+# macOS
+.DS_Store
+
+# 転送用の一時アーカイブ・退避
+*.tgz
+Sources.bak.*
+.bootstrap/
+
+# RTCK local memory (untracked)
+.remember/
