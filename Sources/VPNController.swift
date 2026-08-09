@@ -69,7 +69,6 @@ final class VPNController: @unchecked Sendable {
     var pidURL: URL { dir.appendingPathComponent("openvpn.pid") }
     var resultURL: URL { dir.appendingPathComponent("result.txt") }
     var attemptURL: URL { dir.appendingPathComponent("attempt.txt") }
-    var activeLogURL: URL { dir.appendingPathComponent("activelog.txt") }
     var dnsBackupURL: URL { dir.appendingPathComponent("dns-backup.txt") }
     var portURL: URL { dir.appendingPathComponent("mgmt.port") }
     var dnsStatusURL: URL { dir.appendingPathComponent("dns-status.txt") }
@@ -244,6 +243,10 @@ final class VPNController: @unchecked Sendable {
         mute-replay-warnings
         pull
         connect-retry 1
+        # 混雑したサーバーは AUTH_FAILED を返してくる。既定ではこれが致命傷になり
+        # openvpn ごと終了してしまう（＝常駐が消えて次の接続でまたパスワードが要る）。
+        # nointeract にすると再起動扱いになるので、次の候補へ移れる。
+        auth-retry nointeract
         server-poll-timeout 12
         <connection>
         remote 127.0.0.1 1 udp
@@ -298,6 +301,23 @@ final class VPNController: @unchecked Sendable {
             try fm.setAttributes([.posixPermissions: 0o700], ofItemAtPath: u.path)
         }
         for u in [resultURL, attemptURL] where fm.fileExists(atPath: u.path) { try? fm.removeItem(at: u) }
+        cleanLegacyFiles()
+    }
+
+    /// 旧方式（候補ごとに openvpn を起動し直す run.sh 方式）が残した生成物を消す。
+    /// 放っておくとフォルダに溜まり続けるうえ、取り残された run.sh が
+    /// 新しい常駐プロセスを pid ファイル経由で殺しにいく事故の元になる。
+    func cleanLegacyFiles() {
+        let fm = FileManager.default
+        var junk = ["run.sh", "run.lock", "activelog.txt", "skipped.txt"]
+        for i in 1...8 { junk.append("cand\(i).ovpn") }
+        if let items = try? fm.contentsOfDirectory(atPath: dir.path) {
+            for f in items where f.hasPrefix("try") && f.hasSuffix(".log") { junk.append(f) }
+        }
+        for f in junk {
+            let u = dir.appendingPathComponent(f)
+            if fm.fileExists(atPath: u.path) { try? fm.removeItem(at: u) }
+        }
     }
 
     /// daemon.sh が残す起動結果（DAEMON_OK / DAEMON_FAILED / BAD_PROFILE）
@@ -430,24 +450,10 @@ final class VPNController: @unchecked Sendable {
         return (false, false, 0)
     }
 
-    func activeLogPath() -> String? {
-        if let s = try? String(contentsOf: activeLogURL, encoding: .utf8) {
-            let p = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !p.isEmpty { return p }
-        }
-        return nil
-    }
-
     func recentLog(lines: Int = 200) -> String {
         var files: [String] = []
         if FileManager.default.fileExists(atPath: logURL.path) { files.append(logURL.path) }
-        if let p = activeLogPath() { files.append(p) }
-        if let items = try? FileManager.default.contentsOfDirectory(atPath: dir.path) {
-            for f in items.sorted() where f.hasPrefix("try") && f.hasSuffix(".log") {
-                let full = dir.appendingPathComponent(f).path
-                if !files.contains(full) { files.append(full) }
-            }
-        }
+        if FileManager.default.fileExists(atPath: selfTestLogURL.path) { files.append(selfTestLogURL.path) }
         var text = ""
         for f in files {
             if let s = try? String(contentsOfFile: f, encoding: .utf8) {
