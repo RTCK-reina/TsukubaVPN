@@ -181,7 +181,7 @@ Task {
     print("\n== H. 壊れた設定を渡された場合の防御 ==")
     let brokenSrv = VPNServer(id: "broken", hostName: "broken", ip: "203.0.113.1", score: 0, ping: 10,
                               speedBps: 1_000_000, countryLong: "Japan", countryShort: "JP",
-                              sessions: 0, uptimeMs: 0, configBase64: "!!!not-base64!!!")
+                              sessions: 0, uptimeMs: 0, configBase64: "!!!not-base64!!!", proto: "tcp", isOfficial: false)
     let brokenCand = Candidate(server: brokenSrv, config: "dev tun\nclient\n")
     var threw = false
     var threwMsg = ""
@@ -294,7 +294,7 @@ Task {
     print("\n== L. 壊れた候補が混ざっても残りで接続できるか（全滅しない） ==")
     let junk = VPNServer(id: "junk", hostName: "junk", ip: "203.0.113.9", score: 0, ping: 5,
                          speedBps: 1_000_000, countryLong: "Japan", countryShort: "JP",
-                         sessions: 0, uptimeMs: 0, configBase64: "###broken###")
+                         sessions: 0, uptimeMs: 0, configBase64: "###broken###", proto: "tcp", isOfficial: false)
     let mixed = [Candidate(server: junk, config: "dev tun\nclient\n")] + cands
     var acceptedMixed: [Candidate] = []
     do { acceptedMixed = try ctl.prepare(candidates: mixed, openvpn: ov) }

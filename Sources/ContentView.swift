@@ -14,6 +14,7 @@ struct ContentView: View {
                     if m.dnsNeedsRestore { DNSRestoreCard() }
                     if let issue = m.dnsIssue, !m.dnsNeedsRestore { DNSIssueCard(reason: issue) }
                     if let msg = m.phase.failMessage { FailCard(message: msg) }
+                    if m.phase.isConnected, let s = m.connectedServer { WatchResultCard(server: s) }
                     CountryChips()
                     TargetCard()
                     if m.showList { ServerList() }
@@ -167,6 +168,33 @@ struct DNSIssueCard: View {
     }
 }
 
+/// 動画が見られたかは機械には判定できないので、人間に教えてもらって次回の並び順に反映する。
+struct WatchResultCard: View {
+    let server: VPNServer
+    @EnvironmentObject var m: AppModel
+    var body: some View {
+        CardBox(tint: .blue) {
+            HStack(spacing: 12) {
+                Image(systemName: "play.rectangle.fill").foregroundStyle(.blue).font(.title2)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("見たいものは再生できましたか？").font(.headline)
+                    Text("教えてもらえると、次回このサーバーを優先／回避します。ブロックされたかどうかは機械には分かりません。")
+                        .font(.callout).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer()
+                Button("見られた") { m.markWatchable(server, ok: true) }
+                    .controlSize(.large)
+                Button("ダメだった") { m.markWatchable(server, ok: false) }
+                    .controlSize(.large)
+                if let mk = m.watchMark(server) {
+                    Text(mk).font(.caption).foregroundStyle(mk == "見られた" ? .green : .red)
+                }
+            }
+        }
+    }
+}
+
 struct FailCard: View {
     let message: String
     @EnvironmentObject var m: AppModel
@@ -255,7 +283,7 @@ struct TargetCard: View {
                                         .background(Capsule().fill(Color.green.opacity(0.25)))
                                 }
                             }
-                            Text("速さ \(s.speedText)（\(s.speedWord)） ・ 反応 \(s.pingText) ・ \(s.crowdWord) ・ \(s.ip)")
+                            Text("速さ \(s.speedText) ・ \(s.crowdWord) ・ \(s.protoWord) ・ \(s.originWord) ・ \(s.ip)")
                                 .font(.system(size: 13)).foregroundStyle(.secondary)
                             if m.candidates.count > 1 {
                                 Text("うまくいかない時は自動で他の\(m.candidates.count - 1)台も順に試します")
@@ -315,8 +343,17 @@ struct ServerList: View {
                                 Stars(count: s.stars).frame(width: 74, alignment: .leading)
                                 Text(s.speedText).font(.system(size: 13, design: .monospaced)).frame(width: 92, alignment: .trailing)
                                 Text(s.pingText).font(.system(size: 13, design: .monospaced)).frame(width: 62, alignment: .trailing)
-                                Text(s.crowdWord).font(.system(size: 12)).frame(width: 64, alignment: .trailing)
+                                Text(s.crowdWord).font(.system(size: 12)).frame(width: 56, alignment: .trailing)
                                     .foregroundStyle(s.sessions <= 45 ? Color.secondary : Color.orange)
+                                Text(s.protoWord).font(.system(size: 11, design: .monospaced))
+                                    .frame(width: 34, alignment: .trailing)
+                                    .foregroundStyle(s.proto == "udp" ? Color.green : Color.secondary)
+                                Text(s.originWord).font(.system(size: 11)).frame(width: 68, alignment: .trailing)
+                                    .foregroundStyle(s.isOfficial ? Color.orange : Color.secondary)
+                                if let mk = m.watchMark(s) {
+                                    Text(mk).font(.system(size: 11))
+                                        .foregroundStyle(mk == "見られた" ? Color.green : Color.red)
+                                }
                                 Text(s.ip).font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
                                 Spacer()
                                 if m.manualPick?.id == s.id {
