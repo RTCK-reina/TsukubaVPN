@@ -82,20 +82,26 @@ final class ManagementClient: @unchecked Sendable {
     }
 
     private func readLoop() {
-        var acc = ""
+        // 行分割は必ずバイト列で行う。
+        // openvpn の管理IFは CRLF 区切りで、Swift の String では "\r\n" が
+        // 1つの Character になるため range(of: "\n") が一致せず、
+        // 「受信しているのに1行も取り出せない」という無言の停止になる。
+        var acc = [UInt8]()
         var buf = [UInt8](repeating: 0, count: 8192)
         while !stopped {
             let f = fd
             if f < 0 { break }
             let n = recv(f, &buf, buf.count, 0)
             if n <= 0 { break }
-            acc += String(decoding: buf[0..<n], as: UTF8.self)
-            while let r = acc.range(of: "\n") {
-                var line = String(acc[acc.startIndex..<r.lowerBound])
-                if line.hasSuffix("\r") { line.removeLast() }
-                acc = String(acc[r.upperBound...])
-                if !line.isEmpty { onLine?(line) }
+            acc.append(contentsOf: buf[0..<n])
+            while let idx = acc.firstIndex(of: 0x0A) {
+                var lineBytes = Array(acc[0..<idx])
+                acc.removeFirst(idx + 1)
+                if lineBytes.last == 0x0D { lineBytes.removeLast() }
+                if !lineBytes.isEmpty { onLine?(String(decoding: lineBytes, as: UTF8.self)) }
             }
+            // "ENTER PASSWORD:" のように改行が来ない断片は残る。暴走だけ防ぐ。
+            if acc.count > 1 << 20 { acc.removeAll(keepingCapacity: true) }
         }
         onClose?()
     }
@@ -121,6 +127,13 @@ final class VPNSession: @unchecked Sendable {
 
     /// 接続先を1台あたり何回まで待つか（server-poll-timeout ごとに1回数える）
     static let pollsPerCandidate = 2
+    /// 1候補にかける上限秒数。openvpn の再試行通知だけに頼ると、
+    /// 通知の間隔が想定より延びたときに候補を進められず固まる（実測で踏んだ）。
+    /// 生きているサーバーは2〜7秒でつながるので、20秒あれば十分。
+    static let candidateTimeout: TimeInterval = 20
+
+    /// TVPN_MGMT_DEBUG=1 で管理IFの受信行を標準エラーに流す（検証用）
+    static let debug = ProcessInfo.processInfo.environment["TVPN_MGMT_DEBUG"] != nil
 
     private let client = ManagementClient()
     private let q = DispatchQueue(label: "app.rtck.tsukubavpn.session")
@@ -132,7 +145,19 @@ final class VPNSession: @unchecked Sendable {
     private var connecting = false
     private var finish: ((Outcome) -> Void)?
     private var nudge: DispatchWorkItem?
+    private var candidateTimer: DispatchWorkItem?
+    private var candidateGeneration = 0
     private var holdWaiter: (() -> Void)?
+    /// openvpn が hold（待機）に入っているか。
+    /// **hold 中に `signal SIGUSR1` を送ると openvpn がその場で固まる**（実測）ので、
+    /// 状態を必ず追いかけ、hold 中は `hold release` だけで進める。
+    private var inHold = false
+    /// この connect() で SIGUSR1 を撃ったか（撃つのは1回だけ）
+    private var signalSent = false
+    /// この connect() で接続先を聞かれたか
+    private var sawRemoteQuery = false
+    /// >HOLD: か >STATE: を受け取って、openvpn の状態が分かったか
+    private var stateKnown = false
 
     /// 「いま何台目を試している」等の実況。メインスレッドとは限らない。
     var onProgress: ((Int, VPNServer) -> Void)?
@@ -154,6 +179,9 @@ final class VPNSession: @unchecked Sendable {
             if attached && client.isOpen { ok = true; return }
             client.onLine = { [weak self] line in
                 guard let self else { return }
+                if VPNSession.debug {
+                    FileHandle.standardError.write(Data(("MGMT< " + line + "\n").utf8))
+                }
                 self.q.async { self.handle(line) }
             }
             client.onClose = { [weak self] in
@@ -163,7 +191,17 @@ final class VPNSession: @unchecked Sendable {
             ok = client.open(port: port, password: password)
             attached = ok
         }
-        return ok
+        guard ok else { return false }
+        // openvpn は待機中の相手に対して、接続した直後 >HOLD: を投げてくる。
+        // これを取りこぼしたまま connect() すると「待機中なのに SIGUSR1」になって固まるので、
+        // 状態が分かるまで（もしくは短い時間だけ）待ってから返す。
+        for _ in 0..<20 {
+            var known = false
+            q.sync { known = self.inHold || self.stateKnown }
+            if known { break }
+            usleep(100_000)
+        }
+        return true
     }
 
     func detach() {
@@ -176,8 +214,11 @@ final class VPNSession: @unchecked Sendable {
     // MARK: 操作
 
     /// 候補を順に試して接続する。すでにつながっていれば、そのまま乗り換える。
-    func connect(candidates list: [VPNServer], timeout: TimeInterval = 120) async -> Outcome {
+    /// timeout に 0 を渡すと候補数から自動で決める。
+    func connect(candidates list: [VPNServer], timeout: TimeInterval = 0) async -> Outcome {
         guard !list.isEmpty else { return .exhausted }
+        let limit = timeout > 0 ? timeout
+            : Double(list.count) * (VPNSession.candidateTimeout + 5) + 20
         return await withCheckedContinuation { (cont: CheckedContinuation<Outcome, Never>) in
             let done = OneShot<Outcome> { cont.resume(returning: $0) }
             q.async {
@@ -190,17 +231,26 @@ final class VPNSession: @unchecked Sendable {
                 self.polls = 0
                 self.wantRelease = true
                 self.connecting = true
+                self.signalSent = false
+                self.sawRemoteQuery = false
                 self.finish = { done.fire($0) }
-                // どの状態から呼ばれても確実に「接続先を聞かれる」ところまで持っていく。
-                // ・接続中     → SIGUSR1 で hold に落ちる
-                // ・hold 待機中 → SIGUSR1 は効かないので、あとから hold release で進む
+                // どの状態から呼ばれても「接続先を聞かれる」ところまで持っていく。
+                // 順番が重要で、必ず hold release を先に撃つ。
+                // ・hold 待機中 → release だけで進む（ここで SIGUSR1 を撃つと固まる）
+                // ・接続中／接続処理中 → release は空振りするので、あとから SIGUSR1 で落とす
                 self.client.send("hold on")
-                self.client.send("signal SIGUSR1")
+                if self.inHold {
+                    self.client.send("hold release")
+                    self.inHold = false
+                }
                 self.scheduleNudge(count: 0)
-                self.q.asyncAfter(deadline: .now() + timeout) {
+                self.armCandidateTimer()
+                self.q.asyncAfter(deadline: .now() + limit) {
                     guard self.connecting else { return }
                     self.connecting = false
                     self.finish = nil
+                    self.nudge?.cancel()
+                    self.candidateTimer?.cancel()
                     done.fire(.error("時間内に接続できませんでした"))
                 }
             }
@@ -218,6 +268,10 @@ final class VPNSession: @unchecked Sendable {
                 self.finish = nil
                 self.wantRelease = false
                 self.lastConnected = nil
+                self.nudge?.cancel()
+                self.candidateTimer?.cancel()
+                // すでに待機中なら何もしない（hold 中の SIGUSR1 は openvpn を固める）
+                if self.inHold { done.fire(true); return }
                 self.holdWaiter = { done.fire(true) }
                 self.client.send("hold on")
                 self.client.send("signal SIGUSR1")
@@ -238,8 +292,13 @@ final class VPNSession: @unchecked Sendable {
             finish = nil
             wantRelease = false
             lastConnected = nil
+            nudge?.cancel()
+            candidateTimer?.cancel()
             guard client.isOpen else { return }
             client.send("signal SIGTERM")
+            // hold で待っている場合、release して待機ループから抜けさせないと
+            // 受け取った SIGTERM が処理されない。
+            client.send("hold release")
         }
         usleep(400_000)
         q.sync {
@@ -251,34 +310,85 @@ final class VPNSession: @unchecked Sendable {
 
     // MARK: 受信処理（すべて q の上）
 
+    /// 接続先を聞かれるまで、状態に応じて突っつく。
+    /// hold 中なら release、そうでなければ（＝つながっている／接続処理中なら）
+    /// 一度だけ SIGUSR1 を撃って hold まで落とす。順序を間違えると openvpn が固まる。
     private func scheduleNudge(count: Int) {
         nudge?.cancel()
-        guard count < 5 else { return }
+        guard count < 6 else { return }
         let w = DispatchWorkItem { [weak self] in
-            guard let self, self.connecting, self.wantRelease else { return }
-            self.client.send("hold release")
+            guard let self, self.connecting, self.wantRelease, !self.sawRemoteQuery else { return }
+            if self.inHold {
+                self.client.send("hold release")
+                self.inHold = false
+            } else if !self.signalSent {
+                self.signalSent = true
+                self.client.send("hold on")
+                self.client.send("signal SIGUSR1")
+            }
             self.scheduleNudge(count: count + 1)
         }
         nudge = w
-        q.asyncAfter(deadline: .now() + (count == 0 ? 1.2 : 2.0), execute: w)
+        q.asyncAfter(deadline: .now() + (count == 0 ? 2.5 : 3.0), execute: w)
     }
 
     private var target: VPNServer? {
         candidates.indices.contains(index) ? candidates[index] : nil
     }
 
+    /// 次の候補へ進む。候補が尽きたら待機状態に戻して .exhausted を返す。
+    private func advanceCandidate() {
+        guard connecting else { return }
+        polls = 0
+        index += 1
+        candidateGeneration += 1
+        guard target != nil else {
+            connecting = false
+            nudge?.cancel()
+            candidateTimer?.cancel()
+            let f = finish
+            finish = nil
+            // 候補切れ。hold に落として待機状態へ戻す（次の接続でパスワードは要らない）。
+            wantRelease = false
+            client.send("hold on")
+            client.send("signal SIGUSR1")
+            f?(.exhausted)
+            return
+        }
+        armCandidateTimer()
+    }
+
+    /// 1候補ぶんの制限時間を張り直す
+    private func armCandidateTimer() {
+        candidateTimer?.cancel()
+        let gen = candidateGeneration
+        let w = DispatchWorkItem { [weak self] in
+            guard let self, self.connecting, self.candidateGeneration == gen else { return }
+            self.advanceCandidate()
+        }
+        candidateTimer = w
+        q.asyncAfter(deadline: .now() + VPNSession.candidateTimeout, execute: w)
+    }
+
     private func handle(_ line: String) {
         if line.hasPrefix(">HOLD:") {
+            inHold = true
+            stateKnown = true
             if let w = holdWaiter {
                 holdWaiter = nil
                 nudge?.cancel()
                 w()
                 return
             }
-            if wantRelease { client.send("hold release") }
+            if wantRelease {
+                client.send("hold release")
+                inHold = false
+            }
             return
         }
         if line.hasPrefix(">REMOTE:") {
+            inHold = false
+            sawRemoteQuery = true
             nudge?.cancel()
             let parts = line.dropFirst(">REMOTE:".count).components(separatedBy: ",")
             // openvpn は "tcp-client" のように返してくる
@@ -301,9 +411,12 @@ final class VPNSession: @unchecked Sendable {
             let pt = line.dropFirst(">STATE:".count).components(separatedBy: ",")
             let name = pt.count > 1 ? pt[1] : ""
             let extra = pt.count > 2 ? pt[2] : ""
+            stateKnown = true
+            if name != "EXITING" { inHold = false }
             switch name {
             case "CONNECTED":
                 polls = 0
+                candidateTimer?.cancel()
                 let s = target ?? lastConnected
                 lastConnected = s
                 if connecting, let s {
@@ -318,21 +431,7 @@ final class VPNSession: @unchecked Sendable {
                 if extra == "server_poll" || extra == "connection-reset" || extra == "tls-error" {
                     guard connecting else { return }
                     polls += 1
-                    if polls >= VPNSession.pollsPerCandidate {
-                        polls = 0
-                        index += 1
-                        if target == nil {
-                            connecting = false
-                            nudge?.cancel()
-                            let f = finish
-                            finish = nil
-                            // 候補切れ。hold に落として待機状態へ戻す。
-                            wantRelease = false
-                            client.send("hold on")
-                            client.send("signal SIGUSR1")
-                            f?(.exhausted)
-                        }
-                    }
+                    if polls >= VPNSession.pollsPerCandidate { advanceCandidate() }
                 } else if !connecting, lastConnected != nil {
                     lastConnected = nil
                     onDropped?()
@@ -341,6 +440,7 @@ final class VPNSession: @unchecked Sendable {
                 if connecting {
                     connecting = false
                     nudge?.cancel()
+                    candidateTimer?.cancel()
                     let f = finish
                     finish = nil
                     f?(.error("openvpn が終了しました"))
@@ -356,6 +456,7 @@ final class VPNSession: @unchecked Sendable {
         if connecting {
             connecting = false
             nudge?.cancel()
+            candidateTimer?.cancel()
             let f = finish
             finish = nil
             f?(.error("VPN の管理接続が切れました"))

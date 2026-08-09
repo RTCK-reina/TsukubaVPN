@@ -85,7 +85,9 @@ struct StatusHeader: View {
             }
             return "VPN を通ってインターネットに出ています"
         case .idle:
-            return "いつものインターネット回線をそのまま使っています"
+            return m.daemonReady
+                ? "いつものインターネット回線をそのまま使っています（次はパスワードなしでつながります）"
+                : "いつものインターネット回線をそのまま使っています"
         case .failed:
             return "下のボタンでもう一度お試しください"
         default:
@@ -409,6 +411,16 @@ struct AdvancedSection: View {
                         .background(RoundedRectangle(cornerRadius: 8)
                             .fill((m.selfTestOK == true ? Color.green : (m.selfTestOK == false ? Color.red : Color.gray)).opacity(0.12)))
                 }
+                Divider().padding(.vertical, 2)
+                HStack(spacing: 10) {
+                    Button("VPN を完全に終了する") { Task { await m.shutdown() } }
+                        .disabled(!m.daemonReady || m.phase.isBusy)
+                    Text(m.daemonReady
+                         ? "接続の準備をした状態で裏に残っています。これを押すと完全に片付きます（次はまたパスワードが必要になります）。"
+                         : "いまは裏で動いているものはありません。")
+                        .font(.system(size: 11)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
                 Text("OpenVPN: \(m.openvpnPath ?? "未検出")")
                     .font(.system(size: 12, design: .monospaced)).foregroundStyle(.secondary)
                 Text("接続先は VPN Gate（筑波大学の学術実験プロジェクト）が公開しているボランティア運営の公開VPNサーバーです。通信内容はサーバー運営者に記録される可能性があります。ログインやカード情報など重要な通信には使わないでください。")
@@ -476,6 +488,7 @@ struct BottomBar: View {
     }
     private var note: String {
         if m.phase.isConnected { return "切ると、いつものインターネット回線に戻ります。" }
-        return "つなぐときに Mac のパスワードを1回だけ聞かれます。それだけで大丈夫です。"
+        if m.daemonReady { return "準備できています。パスワードなしですぐつながります。" }
+        return "最初の1回だけ Mac のパスワードを聞かれます。そのあとは、切っても入れ直しても聞かれません。"
     }
 }

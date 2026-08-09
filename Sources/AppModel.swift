@@ -373,14 +373,20 @@ final class AppModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
         daemonReady = false
+        var ok = true
         if ctl.isRunning() {
             let c = ctl
-            return await Task.detached(priority: .userInitiated) { () -> Bool in
+            ok = await Task.detached(priority: .userInitiated) { () -> Bool in
                 _ = VPNController.elevate(script: c.stopURL.path)
                 return !c.isRunning()
             }.value
         }
-        return true
+        connectedServer = nil
+        if !phase.isBusy, phase.failMessage == nil { phase = .idle }
+        progressText = ""
+        dnsIssue = ctl.dnsIssue()
+        dnsNeedsRestore = ctl.dnsBackupExists()
+        return ok
     }
 
     // MARK: - その他

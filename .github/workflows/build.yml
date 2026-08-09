@@ -41,10 +41,10 @@ jobs:
           SDK="$(xcrun --show-sdk-path)"
           swiftc -target arm64-apple-macos14.0 -sdk "$SDK" -o /tmp/verify \
             Sources/Models.swift Sources/VPNGateAPI.swift Sources/Scripts.swift \
-            Sources/VPNController.swift Test/main.swift
+            Sources/VPNController.swift Sources/Management.swift Test/main.swift
           swiftc -target arm64-apple-macos14.0 -sdk "$SDK" -o /tmp/livetest \
             Sources/Models.swift Sources/VPNGateAPI.swift Sources/Scripts.swift \
-            Sources/VPNController.swift Test/Live/main.swift
+            Sources/VPNController.swift Sources/Management.swift Test/Live/main.swift
 
       - name: 生成されるシェルの構文を検査
         run: |
@@ -57,7 +57,7 @@ jobs:
           def unswift(t):
               return t.replace('\\\\', '\x00').replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\x00', '\\')
           ng = 0
-          for name in ["run", "stop", "up", "down", "selftest"]:
+          for name in ["daemon", "stop", "up", "down", "selftest"]:
               m = re.search(r'static let %s = """\n(.*?)\n    """' % name, src, re.S)
               if not m:
                   print(f"NG: {name} が見つからない"); ng += 1; continue
