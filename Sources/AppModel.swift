@@ -32,14 +32,49 @@ final class AppModel: ObservableObject {
     @Published var lastFetched: Date?
 
     /// 直近に失敗したサーバー（10分間は後回しにする）。混雑・拒否されたサーバーを掴み続けないため。
+    /// 「このサーバーで実際に見られた／弾かれた」の記録。
+    /// 配信サービスにブロックされているかは接続の成否では分からないので、人間に教えてもらうしかない。
+    @Published private(set) var watchedOK: Set<String> = []
+    @Published private(set) var watchedNG: Set<String> = []
+    private let okKey = "watchedOK", ngKey = "watchedNG"
+
     private var recentFailures: [String: Date] = [:]
     private let failureCooldown: TimeInterval = 600
 
     private let ctl = VPNController.shared
     private var pollTask: Task<Void, Never>?
 
+    private func loadWatched() {
+        watchedOK = Set(UserDefaults.standard.stringArray(forKey: okKey) ?? [])
+        watchedNG = Set(UserDefaults.standard.stringArray(forKey: ngKey) ?? [])
+    }
+    private func saveWatched() {
+        UserDefaults.standard.set(Array(watchedOK), forKey: okKey)
+        UserDefaults.standard.set(Array(watchedNG), forKey: ngKey)
+    }
+    func markWatchable(_ s: VPNServer, ok: Bool) {
+        if ok { watchedOK.insert(s.hostName); watchedNG.remove(s.hostName) }
+        else { watchedNG.insert(s.hostName); watchedOK.remove(s.hostName) }
+        saveWatched()
+    }
+    func watchMark(_ s: VPNServer) -> String? {
+        if watchedOK.contains(s.hostName) { return "見られた" }
+        if watchedNG.contains(s.hostName) { return "ダメだった" }
+        return nil
+    }
+
+    /// 並び順の最終スコア。素の rank に、人間が教えてくれた実績を強く足し引きする。
+    func score(_ s: VPNServer) -> Double {
+        var v = s.rank
+        if watchedOK.contains(s.hostName) { v += 400 }
+        if watchedNG.contains(s.hostName) { v -= 600 }
+        if isRecentlyFailed(s) { v -= 300 }
+        return v
+    }
+
     // MARK: - 起動時
     func bootstrap() async {
+        loadWatched()
         dnsNeedsRestore = ctl.dnsNeedsRestore()
         dnsIssue = ctl.dnsIssue()
         if ctl.isRunning() {
@@ -57,7 +92,7 @@ final class AppModel: ObservableObject {
         loadError = nil
         do {
             let list = try await VPNGateAPI.fetch()
-            servers = list.sorted { $0.rank > $1.rank }
+            servers = list
             if servers.first(where: { $0.countryShort == country }) == nil {
                 country = topCountries.first ?? "ALL"
             }
@@ -105,11 +140,7 @@ final class AppModel: ObservableObject {
 
     var filtered: [VPNServer] {
         let list = country == "ALL" ? servers : servers.filter { $0.countryShort == country }
-        return list.sorted { a, b in
-            let fa = isRecentlyFailed(a), fb = isRecentlyFailed(b)
-            if fa != fb { return !fa }
-            return a.rank > b.rank
-        }
+        return list.sorted { score($0) > score($1) }
     }
 
     /// 実際に使う候補（1番目 = メイン、以降は自動フォールバック用）。
@@ -130,7 +161,8 @@ final class AppModel: ObservableObject {
             add(s)
         }
         // 次に「空いている」サーバーを混ぜる。混雑で断られたときの保険になる。
-        let roomy = pool.filter { $0.speedMbps >= 8 && !isRecentlyFailed($0) }
+        // 保険枠も、ブロックされにくい個人サーバーの空いているものから採る
+        let roomy = pool.filter { $0.speedMbps >= 8 && !$0.isOfficial && !isRecentlyFailed($0) && !watchedNG.contains($0.hostName) }
             .sorted { $0.sessions < $1.sessions }
         for s in roomy {
             if out.count >= AppModel.candidateCount { break }

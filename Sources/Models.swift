@@ -19,6 +19,11 @@ struct VPNServer: Identifiable, Hashable {
     let sessions: Int
     let uptimeMs: Int
     let configBase64: String
+    /// 設定に書かれていた proto（tcp / udp）
+    let proto: String
+    /// VPN Gate 公式クラスタ（public-vpn-*.opengw.net）か。
+    /// 動画配信サービスに最初にブロックされるのがこの帯なので、用途によっては避けたい。
+    let isOfficial: Bool
 
     var speedMbps: Double { Double(speedBps) / 1_000_000.0 }
     var uptimeDays: Int { max(0, uptimeMs / 86_400_000) }
@@ -54,14 +59,38 @@ struct VPNServer: Identifiable, Hashable {
         return "おそい"
     }
     /// 並び替え用スコア（大きいほど良い）。
-    /// 公開VPNは「速いが満員で断られる」サーバーが多いため、混雑度を重く見る。
+    ///
+    /// このアプリの用途は「海外から日本のエンタメを見る」なので、
+    /// 評価軸は「速いか」ではなく **「ブロックされずに、途切れずに再生できるか」**。
+    /// 生の帯域を追うと必ず公式クラスタ（219.100.37.x）が1位になるが、
+    /// あそこは世界中で使われている既知のVPN帯で、配信サービスに真っ先に弾かれる。
     var rank: Double {
-        var r = min(speedMbps, 900.0) * 0.8
-        if ping > 0 { r -= Double(min(ping, 400)) * 1.2 } else { r -= 200 }
-        r += Double(min(uptimeDays, 60)) * 1.5
-        r -= Double(min(sessions, 150)) * 1.2
+        // 速度は「足りていれば十分」。4K で 25Mbps、余裕を見て 60Mbps で頭打ちにする。
+        // それ以上の帯域は再生体験を改善しないので、点差にしない。
+        let usable = min(speedMbps, 60.0)
+        var r = usable * 4.0
+
+        // 混雑は体感に直結する。実効帯域は同時利用者で割られる。
+        r -= Double(min(sessions, 200)) * 2.5
+
+        // 応答は多少悪くても動画では効かない。軽く見る。
+        if ping > 0 { r -= Double(min(ping, 300)) * 0.4 } else { r -= 120 }
+
+        // 長く動いている個人サーバーは落ちにくい。
+        r += Double(min(uptimeDays, 60)) * 2.0
+
+        // TCP over TCP は再送が増幅して動画が詰まりやすい。UDP を明確に優遇する。
+        if proto == "udp" { r += 120 }
+
+        // 公式クラスタは既知のVPN帯。速いが最もブロックされやすいので後ろへ。
+        if isOfficial { r -= 260 }
+
         return r
     }
+
+    /// 素性の表示（住宅回線かどうかが実質のブロック耐性）
+    var originWord: String { isOfficial ? "公式・要注意" : "個人" }
+    var protoWord: String { proto == "udp" ? "UDP" : "TCP" }
 
     /// 混み具合（少ないほど接続が通りやすい）
     var crowdWord: String {

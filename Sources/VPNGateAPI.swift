@@ -49,6 +49,17 @@ enum VPNGateAPI {
             guard cfg.count > 400 else { continue }
             let ip = f[1].trimmingCharacters(in: .whitespaces)
             guard !ip.isEmpty else { continue }
+            // proto は設定本文にしか書かれていないので、ここで一度だけ読む
+            var proto = "tcp"
+            if let cfg = decodeConfig(cfg) {
+                for line in cfg.normalizedLines {
+                    let t = line.trimmingCharacters(in: .whitespaces).lowercased()
+                    if t.hasPrefix("proto ") {
+                        proto = t.hasSuffix("udp") ? "udp" : "tcp"
+                        break
+                    }
+                }
+            }
             let s = VPNServer(
                 id: f[0].isEmpty ? ip : f[0],
                 hostName: f[0],
@@ -60,7 +71,9 @@ enum VPNGateAPI {
                 countryShort: f[6].uppercased(),
                 sessions: Int(f[7]) ?? 0,
                 uptimeMs: Int(f[8]) ?? 0,
-                configBase64: cfg)
+                configBase64: cfg,
+                proto: proto,
+                isOfficial: f[0].lowercased().hasPrefix("public-vpn"))
             out.append(s)
         }
         var seen = Set<String>()
