@@ -82,7 +82,7 @@ for f in sorted(glob.glob(os.path.join(d, "openvpn", "*.log"))):
     hits = [l for l in body.splitlines() if pat.search(l)]
     out.append(f"### {os.path.basename(f)}（{len(body.splitlines())}行中 {len(hits)}行を抽出）")
     out.append("```\n" + "\n".join(hits[:80]) + "\n```\n")
-for name in ["result.txt", "attempt.txt", "dns-status.txt", "skipped.txt", "activelog.txt"]:
+for name in ["result.txt", "dns-status.txt", "openvpn.log"]:
     p = os.path.join(d, "openvpn", name)
     if os.path.exists(p):
         out.append(f"- `{name}`: `{read(p).strip()}`")

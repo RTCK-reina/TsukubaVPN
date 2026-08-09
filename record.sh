@@ -104,7 +104,7 @@ stop)
     echo "名前解決: $(dns_ok)"
   } > "$DIR/after.txt" 2>&1
   cp -f "$WORK"/*.log "$DIR/openvpn/" 2>/dev/null
-  cp -f "$WORK"/result.txt "$WORK"/attempt.txt "$WORK"/dns-status.txt "$WORK"/skipped.txt "$WORK"/activelog.txt "$DIR/openvpn/" 2>/dev/null
+  cp -f "$WORK"/result.txt "$WORK"/dns-status.txt "$WORK"/openvpn.log "$DIR/openvpn/" 2>/dev/null
   /usr/bin/python3 "$0.report.py" "$DIR" > "$DIR/report.md" 2>&1
   echo "記録を停止しました。"
   echo "  レポート: $DIR/report.md"
@@ -126,7 +126,7 @@ __loop)
   while [ ! -f "$DIR/STOP" ] && [ "$i" -lt "$MAX" ]; do
     i=$((i+1))
     R="$(def_route)"; U="$(utun_list)"; UI="$(utun_ips)"; D="$(dns_state)"
-    P="$(ovpn_pids)"; RES="$(readf "$WORK/result.txt")"; ATT="$(readf "$WORK/attempt.txt")"
+    P="$(ovpn_pids)"; RES="$(readf "$WORK/result.txt")"; ATT="$(readf "$WORK/mgmt.port")"
     DS="$(readf "$WORK/dns-status.txt")"; AP="$(app_running)"
     key="$R|$U|$D|$P|$RES|$ATT|$DS|$AP"
     IP="-"; DOK="-"
@@ -143,11 +143,11 @@ __loop)
         echo "    utun      : ${U:-なし}   ${UI:-}"
         echo "    DNS       : $D"
         echo "    openvpn   : ${P:-なし}"
-        echo "    result    : $RES / attempt: $ATT / dns-status: $DS"
+        echo "    result    : $RES / mgmt port: $ATT / dns-status: $DS"
         echo "    アプリ    : $AP"
         [ "$IP" != "-" ] && echo "    グローバルIP: $IP  名前解決: $DOK"
       } >> "$EV"
-      [ -n "$P" ] && cp -f "$WORK"/try*.log "$DIR/openvpn/" 2>/dev/null
+      [ -n "$P" ] && cp -f "$WORK"/openvpn.log "$DIR/openvpn/" 2>/dev/null
     fi
     if [ "$IP" != "-" ] && [ "$IP" != "$last_ip" ] && [ -n "$last_ip" ]; then
       echo "[$(now)] グローバルIPが変わりました: $last_ip → $IP （名前解決: $DOK）" >> "$EV"

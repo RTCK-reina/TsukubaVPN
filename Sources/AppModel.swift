@@ -79,6 +79,16 @@ final class AppModel: ObservableObject {
     func bootstrap() async {
         loadWatched()
         dnsIssue = ctl.dnsIssue()
+        session.onDetached = { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.daemonReady = false
+                if self.phase.isConnected {
+                    self.connectedServer = nil
+                    self.phase = .failed("VPN が終了しました。もう一度「つなぐ」を押してください。")
+                }
+            }
+        }
         session.onDropped = { [weak self] in
             Task { @MainActor in
                 guard let self, self.phase.isConnected else { return }

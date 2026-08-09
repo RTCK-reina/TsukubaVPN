@@ -163,6 +163,8 @@ final class VPNSession: @unchecked Sendable {
     var onProgress: ((Int, VPNServer) -> Void)?
     /// つながっていたのに切れた（サーバー側都合など）
     var onDropped: (() -> Void)?
+    /// 常駐 openvpn が居なくなった（管理ソケットが閉じた）
+    var onDetached: (() -> Void)?
 
     private(set) var attached = false
     private(set) var lastConnected: VPNServer?
@@ -247,11 +249,7 @@ final class VPNSession: @unchecked Sendable {
                 self.armCandidateTimer()
                 self.q.asyncAfter(deadline: .now() + limit) {
                     guard self.connecting else { return }
-                    self.connecting = false
-                    self.finish = nil
-                    self.nudge?.cancel()
-                    self.candidateTimer?.cancel()
-                    done.fire(.error("時間内に接続できませんでした"))
+                    self.finishConnecting(.error("時間内に接続できませんでした"))
                 }
             }
         }
@@ -336,6 +334,18 @@ final class VPNSession: @unchecked Sendable {
         candidates.indices.contains(index) ? candidates[index] : nil
     }
 
+    /// 接続処理を終える。ここを通さないと wantRelease が残り、
+    /// `>HOLD:` のたびに hold release を撃ち続ける無限ループになる。
+    private func finishConnecting(_ outcome: Outcome) {
+        connecting = false
+        wantRelease = false
+        nudge?.cancel()
+        candidateTimer?.cancel()
+        let f = finish
+        finish = nil
+        f?(outcome)
+    }
+
     /// 次の候補へ進む。候補が尽きたら待機状態に戻して .exhausted を返す。
     private func advanceCandidate() {
         guard connecting else { return }
@@ -343,16 +353,10 @@ final class VPNSession: @unchecked Sendable {
         index += 1
         candidateGeneration += 1
         guard target != nil else {
-            connecting = false
-            nudge?.cancel()
-            candidateTimer?.cancel()
-            let f = finish
-            finish = nil
-            // 候補切れ。hold に落として待機状態へ戻す（次の接続でパスワードは要らない）。
-            wantRelease = false
-            client.send("hold on")
-            client.send("signal SIGUSR1")
-            f?(.exhausted)
+            // 候補切れ。ここで SIGUSR1 を撃つと、直後に飛んでくる接続先の問い合わせと
+            // 競合して openvpn が終了しかねない。hold は常に armed なので、
+            // 「もう接続先を答えない」だけで自然に待機状態へ戻る。
+            finishConnecting(.exhausted)
             return
         }
         armCandidateTimer()
@@ -394,9 +398,11 @@ final class VPNSession: @unchecked Sendable {
             // openvpn は "tcp-client" のように返してくる
             let proto = (parts.count >= 3 ? parts[2] : "").components(separatedBy: "-").first ?? ""
             guard connecting, let t = target else {
-                // 接続する気がないのに聞かれた場合、片方を SKIP すると
-                // 候補を使い切って openvpn ごと終了してしまう。必ず何か答える。
-                client.send("remote SKIP")
+                // 接続する気がないのに聞かれた場合。
+                // **両方の <connection> に SKIP を返すと openvpn は候補を使い切って終了する**ので、
+                // 必ず片方には接続先を答える。127.0.0.1:1 は即座に拒否されるため、
+                // openvpn はすぐ再起動して hold（待機）に戻る。
+                client.send(proto == "tcp" ? "remote MOD 127.0.0.1 1" : "remote SKIP")
                 return
             }
             if proto == t.proto {
@@ -419,16 +425,11 @@ final class VPNSession: @unchecked Sendable {
                 candidateTimer?.cancel()
                 let s = target ?? lastConnected
                 lastConnected = s
-                if connecting, let s {
-                    connecting = false
-                    nudge?.cancel()
-                    let f = finish
-                    finish = nil
-                    f?(.connected(s))
-                }
+                if connecting, let s { finishConnecting(.connected(s)) }
             case "RECONNECTING":
                 // server_poll = 接続先が応答しなかった。自分で投げた SIGUSR1 は数えない。
-                if extra == "server_poll" || extra == "connection-reset" || extra == "tls-error" {
+                if extra == "server_poll" || extra == "connection-reset"
+                    || extra == "tls-error" || extra == "auth-failure" {
                     guard connecting else { return }
                     polls += 1
                     if polls >= VPNSession.pollsPerCandidate { advanceCandidate() }
@@ -437,14 +438,7 @@ final class VPNSession: @unchecked Sendable {
                     onDropped?()
                 }
             case "EXITING":
-                if connecting {
-                    connecting = false
-                    nudge?.cancel()
-                    candidateTimer?.cancel()
-                    let f = finish
-                    finish = nil
-                    f?(.error("openvpn が終了しました"))
-                }
+                if connecting { finishConnecting(.error("openvpn が終了しました")) }
             default:
                 break
             }
@@ -453,14 +447,11 @@ final class VPNSession: @unchecked Sendable {
 
     private func handleClosed() {
         attached = false
-        if connecting {
-            connecting = false
-            nudge?.cancel()
-            candidateTimer?.cancel()
-            let f = finish
-            finish = nil
-            f?(.error("VPN の管理接続が切れました"))
-        }
+        if connecting { finishConnecting(.error("VPN の管理接続が切れました")) }
+        inHold = false
+        stateKnown = false
+        lastConnected = nil
+        onDetached?()
         if let w = holdWaiter {
             holdWaiter = nil
             w()
