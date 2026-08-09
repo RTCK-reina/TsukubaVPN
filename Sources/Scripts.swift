@@ -2,112 +2,74 @@ import Foundation
 
 enum Scripts {
 
-    /// 接続本体。root で実行される。候補を順に試し、最初に成功したものを採用する。
-    static let run = """
+    /// openvpn を常駐起動する。root で実行されるのは**このスクリプトだけ**で、しかも1回きり。
+    ///
+    /// 起動したあとの「どのサーバーにつなぐか」「別のサーバーに乗り換える」「切る」は
+    /// すべて管理インターフェース（127.0.0.1、パスワード付き）越しに一般ユーザー権限で行う。
+    /// --management-query-remote があるので、接続先は起動時に決めなくてよい。
+    static let daemon = """
     #!/bin/sh
     D='__DIR__'
     OV='__OV__'
-    N=__N__
     PORT=__PORT__
-    LOCK="$D/run.lock"
-    # 二重起動の防止。取り残された古い接続処理が新しいプロセスを殺しにいくのを防ぐ。
-    if [ -f "$LOCK" ]; then
-      OLD=$(cat "$LOCK" 2>/dev/null)
-      if [ -n "$OLD" ] && kill -0 "$OLD" 2>/dev/null; then
-        echo "BUSY" > "$D/result.txt"
-        chmod 644 "$D/result.txt" 2>/dev/null
-        exit 3
-      fi
+    # すでに常駐していれば何もしない
+    P=$(cat "$D/openvpn.pid" 2>/dev/null)
+    if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then
+      echo "DAEMON_OK" > "$D/result.txt"
+      chmod 644 "$D/result.txt" 2>/dev/null
+      exit 0
     fi
-    echo $$ > "$LOCK"
-    chmod 644 "$LOCK" 2>/dev/null
-    trap 'rm -f "$LOCK"' EXIT INT TERM HUP
-    rm -f "$D/result.txt" "$D/attempt.txt" "$D/openvpn.pid" "$D/activelog.txt" "$D/skipped.txt" "$D/dns-status.txt"
-    rm -f "$D"/try*.log
-    i=1
-    while [ "$i" -le "$N" ]; do
-      CFG="$D/cand$i.ovpn"
-      if [ ! -f "$CFG" ]; then i=$((i+1)); continue; fi
-      SZ=$(wc -c < "$CFG" 2>/dev/null | tr -d ' ')
-      if [ -z "$SZ" ] || [ "$SZ" -lt 1000 ] || ! grep -q "<ca>" "$CFG"; then
-        echo "SKIP cand$i (broken config, $SZ bytes)" >> "$D/skipped.txt"
-        i=$((i+1)); continue
-      fi
-      echo "$i" > "$D/attempt.txt"
-      chmod 644 "$D/attempt.txt" 2>/dev/null
-      LOG="$D/try$i.log"
-      pj=0
-      while [ "$pj" -lt 8 ]; do
-        : > "$LOG"
-        chmod 644 "$LOG" 2>/dev/null
-        rm -f "$D/openvpn.pid"
-        "$OV" --config "$CFG" --cd "$D" --log-append "$LOG" --verb 3 --mute-replay-warnings --management 127.0.0.1 "$PORT" "$D/mgmt.pass" --writepid "$D/openvpn.pid" --script-security 2 --up "$D/up.sh" --down "$D/down.sh" --down-pre --connect-retry-max 1 --connect-timeout 10 --resolv-retry 6 --daemon >> "$LOG" 2>&1
-        sleep 0.4
-        if grep -q "Socket bind failed" "$LOG" 2>/dev/null; then
-          PORT=$((PORT+1))
-          pj=$((pj+1))
-          continue
-        fi
-        break
-      done
-      echo "$PORT" > "$D/mgmt.port"
-      chmod 644 "$D/mgmt.port" 2>/dev/null
-      if [ "$pj" -ge 8 ]; then
-        echo "PORT_BUSY" > "$D/result.txt"
-        chmod 644 "$D/result.txt" 2>/dev/null
-        exit 2
-      fi
-      n=0
-      while [ "$n" -lt 44 ]; do
-        if grep -q "Initialization Sequence Completed" "$LOG" 2>/dev/null; then
-          echo "$LOG" > "$D/activelog.txt"
-          chmod 644 "$D/activelog.txt" 2>/dev/null
-          echo "OK $i" > "$D/result.txt"
-          chmod 644 "$D/result.txt" "$D/openvpn.pid" 2>/dev/null
-          exit 0
-        fi
-        if grep -q -E "Exiting due to fatal error|Options error|AUTH_FAILED|Cannot allocate TUN" "$LOG" 2>/dev/null; then
-          break
-        fi
-        P=$(cat "$D/openvpn.pid" 2>/dev/null)
-        if [ -n "$P" ]; then
-          if ! kill -0 "$P" 2>/dev/null; then break; fi
-        fi
-        sleep 0.5
-        n=$((n+1))
-      done
-      P=$(cat "$D/openvpn.pid" 2>/dev/null)
-      if [ -n "$P" ]; then
-        kill "$P" 2>/dev/null
-        sleep 1
-        kill -9 "$P" 2>/dev/null
-      fi
-      i=$((i+1))
+    rm -f "$D/openvpn.pid" "$D/result.txt" "$D/dns-status.txt"
+    : > "$D/openvpn.log"
+    chmod 644 "$D/openvpn.log" 2>/dev/null
+    CFG="$D/shared.ovpn"
+    SZ=$(wc -c < "$CFG" 2>/dev/null | tr -d ' ')
+    if [ -z "$SZ" ] || [ "$SZ" -lt 1000 ] || ! grep -q "<ca>" "$CFG"; then
+      echo "BAD_PROFILE" > "$D/result.txt"
+      chmod 644 "$D/result.txt" 2>/dev/null
+      exit 2
+    fi
+    "$OV" --config "$CFG" --cd "$D" \\
+      --log-append "$D/openvpn.log" --verb 3 --mute-replay-warnings \\
+      --management 127.0.0.1 "$PORT" "$D/mgmt.pass" \\
+      --management-query-remote --management-hold \\
+      --writepid "$D/openvpn.pid" \\
+      --script-security 2 --up "$D/up.sh" --down "$D/down.sh" --down-pre --up-restart \\
+      --daemon >> "$D/openvpn.log" 2>&1
+    n=0
+    while [ "$n" -lt 40 ]; do
+      if [ -s "$D/openvpn.pid" ]; then break; fi
+      sleep 0.25
+      n=$((n+1))
     done
-    /bin/sh "$D/down.sh" >/dev/null 2>&1
-    rm -f "$D/openvpn.pid"
-    echo "NG" > "$D/result.txt"
+    chmod 644 "$D/openvpn.pid" 2>/dev/null
+    if [ ! -s "$D/openvpn.pid" ]; then
+      echo "DAEMON_FAILED" > "$D/result.txt"
+      chmod 644 "$D/result.txt" 2>/dev/null
+      exit 1
+    fi
+    echo "$PORT" > "$D/mgmt.port"
+    chmod 644 "$D/mgmt.port" 2>/dev/null
+    echo "DAEMON_OK" > "$D/result.txt"
     chmod 644 "$D/result.txt" 2>/dev/null
-    exit 1
+    exit 0
     """
 
-    /// 強制停止（管理インターフェースが使えない場合の保険）。root で実行される。
+    /// 非常用の強制停止。管理ソケットが使えないときだけ使う（root が要る）。
     static let stop = """
     #!/bin/sh
     D='__DIR__'
-    L=$(cat "$D/run.lock" 2>/dev/null)
-    if [ -n "$L" ]; then kill "$L" 2>/dev/null; sleep 1; kill -9 "$L" 2>/dev/null; fi
-    rm -f "$D/run.lock"
     P=$(cat "$D/openvpn.pid" 2>/dev/null)
     if [ -n "$P" ]; then
       kill "$P" 2>/dev/null
       sleep 1
       kill -9 "$P" 2>/dev/null
     fi
+    pkill -f "$D/shared.ovpn" 2>/dev/null
     pkill -f "$D/cand" 2>/dev/null
     sleep 1
     /bin/sh "$D/down.sh" >/dev/null 2>&1
-    rm -f "$D/openvpn.pid"
+    rm -f "$D/openvpn.pid" "$D/run.lock"
     exit 0
     """
 
